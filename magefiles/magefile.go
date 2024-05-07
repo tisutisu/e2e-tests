@@ -622,6 +622,31 @@ func SetupMultiPlatformTests() error {
 	return nil
 }
 
+func SetupSourceBuild() {
+	var err error
+	var defaultBundleRef string
+	var tektonObj runtime.Object
+	klog.Info("creating new tekton bundle for the purpose of testing build-task-dockerfiles PR")
+	sourceImage := utils.GetEnv("SOURCE_IMAGE", "")
+	if sourceImage == "" {
+		klog.Error("SOURCE_IMAGE env is not set")
+		return
+	}
+	// if err = utils.CreateDockerConfigFile(os.Getenv("QUAY_TOKEN")); err != nil {
+	// 	klog.Errorf("failed to create docker config file: %+v", err)
+	// 	return
+	// }
+	if defaultBundleRef, err = tekton.GetDefaultPipelineBundleRef(constants.BuildPipelineSelectorYamlURL, "Docker build"); err != nil {
+		klog.Errorf("failed to get the pipeline bundle ref: %+v", err)
+		return
+	}
+	if tektonObj, err = tekton.ExtractTektonObjectFromBundle(defaultBundleRef, "pipeline", "docker-build"); err != nil {
+		klog.Errorf("failed to extract the Tekton Pipeline from bundle: %+v", err)
+		return
+	}
+	klog.Infof("GOT PIPELINE DOCKER_BUILD: %v", tektonObj)
+}
+
 func BootstrapCluster() error {
 	envVars := map[string]string{}
 
