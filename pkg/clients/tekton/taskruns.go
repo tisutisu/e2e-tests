@@ -127,7 +127,7 @@ func (t *TektonController) GetTaskRunLogs(pipelineRunName, pipelineTaskName, nam
 		if containerLogs, err := t.fetchContainerLog(podName, containerName, namespace); err == nil {
 			logs[containerName] = containerLogs
 		} else {
-			logs[containerName] = "failed to get logs"
+			logs[containerName] = fmt.Sprintf("%s: %s", "failed to get logs with error", err.Error())
 		}
 	}
 	return logs, nil
