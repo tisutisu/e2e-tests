@@ -626,16 +626,19 @@ func SetupSourceBuild() {
 	var err error
 	var defaultBundleRef string
 	var tektonObj runtime.Object
+	var newPipelineYaml []byte
 	klog.Info("creating new tekton bundle for the purpose of testing build-task-dockerfiles PR")
+
 	sourceImage := utils.GetEnv("SOURCE_IMAGE", "")
-	if sourceImage == "" {
-		klog.Error("SOURCE_IMAGE env is not set")
+	quayToken := utils.GetEnv("QUAY_TOKEN", "")
+	if sourceImage == "" || quayToken == "" {
+		klog.Error("SOURCE_IMAGE or QUAY_TOKEN env is not set")
 		return
 	}
-	// if err = utils.CreateDockerConfigFile(os.Getenv("QUAY_TOKEN")); err != nil {
-	// 	klog.Errorf("failed to create docker config file: %+v", err)
-	// 	return
-	// }
+	if err = utils.CreateDockerConfigFile(os.Getenv("QUAY_TOKEN")); err != nil {
+		klog.Errorf("failed to create docker config file: %+v", err)
+		return
+	}
 	if defaultBundleRef, err = tekton.GetDefaultPipelineBundleRef(constants.BuildPipelineSelectorYamlURL, "Docker build"); err != nil {
 		klog.Errorf("failed to get the pipeline bundle ref: %+v", err)
 		return
@@ -644,7 +647,51 @@ func SetupSourceBuild() {
 		klog.Errorf("failed to extract the Tekton Pipeline from bundle: %+v", err)
 		return
 	}
-	klog.Infof("GOT PIPELINE DOCKER_BUILD: %v", tektonObj)
+	dockerPipelineObject := tektonObj.(*tektonapi.Pipeline)
+
+	var currentSourceTaskRef string
+	for i := range dockerPipelineObject.PipelineSpec().Tasks {
+		t := &dockerPipelineObject.PipelineSpec().Tasks[i]
+		params := t.TaskRef.Params
+		var lastBundle *tektonapi.Param
+		sourceTask := false
+		for i, param := range params {
+			if param.Name == "bundle" {
+				lastBundle = &t.TaskRef.Params[i]
+			} else if param.Name == "name" && param.Value.StringVal == "source-build" {
+				sourceTask = true
+			}
+		}
+		if sourceTask {
+			currentSourceTaskRef = lastBundle.Value.StringVal
+			klog.Infof("Found current task ref %s", currentSourceTaskRef)
+			lastBundle.Value = *tektonapi.NewStructuredValues(sourceImage)
+			break
+		}
+	}
+	if currentSourceTaskRef == "" {
+		klog.Errorf("failed to extract the Tekton Task from bundle: %+v", err)
+		return
+	}
+	if newPipelineYaml, err = yaml.Marshal(dockerPipelineObject); err != nil {
+		klog.Errorf("error when marshalling a new pipeline to YAML: %v", err)
+		return
+	}
+	keychain := authn.NewMultiKeychain(authn.DefaultKeychain)
+	authOption := remoteimg.WithAuthFromKeychain(keychain)
+
+	tag := fmt.Sprintf("%d-%s", time.Now().Unix(), util.GenerateRandomString(4))
+	quayOrg := utils.GetEnv(constants.DEFAULT_QUAY_ORG_ENV, constants.DefaultQuayOrg)
+	newSourceBuildPipelineImg := strings.ReplaceAll(constants.DefaultImagePushRepo, constants.DefaultQuayOrg, quayOrg)
+	var newSourceBuildPipeline, _ = name.ParseReference(fmt.Sprintf("%s:pipeline-bundle-%s", newSourceBuildPipelineImg, tag))
+
+	if err = tekton.BuildAndPushTektonBundle(newPipelineYaml, newSourceBuildPipeline, authOption); err != nil {
+		klog.Errorf("error when building/pushing a tekton pipeline bundle: %v", err)
+		return
+	}
+
+	// klog.Infof("SETTING ENV VAR %s to value %s\n", constants.CUSTOM_BUILDAH_REMOTE_PIPELINE_BUILD_BUNDLE_ENV, newSourceBuildPipeline.String())
+	// os.Setenv(constants.CUSTOM_BUILDAH_REMOTE_PIPELINE_BUILD_BUNDLE_ENV, newSourceBuildPipeline.String())
 }
 
 func BootstrapCluster() error {
