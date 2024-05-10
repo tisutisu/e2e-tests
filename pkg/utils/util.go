@@ -196,7 +196,7 @@ func CreateDockerConfigFile(base64EncodedString string) error {
 	var rawRegistryCreds []byte
 	var homeDir string
 	var err error
-
+	fmt.Printf("ENCODED STRING VALUE: %q\n", base64EncodedString)
 	if rawRegistryCreds, err = base64.StdEncoding.DecodeString(base64EncodedString); err != nil {
 		return fmt.Errorf("unable to decode container registry credentials: %v", err)
 	}
