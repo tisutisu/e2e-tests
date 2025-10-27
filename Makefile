@@ -79,4 +79,4 @@ setup-multi-platform-tests:
 	./mage -v SetupMultiPlatformTests
 
 setup-only-source-build:
-	./mage -v SetupBundleForBuildTasksDockerfilesRepo
+	./mage -v -debug SetupBundleForBuildTasksDockerfilesRepo
