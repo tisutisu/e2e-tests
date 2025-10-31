@@ -691,6 +691,659 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 		})
 	},
 		Entry("github", git.GitHubProvider, "gh"),
+		//Entry("gitlab", git.GitLabProvider, "gl"),
+	)
+	DescribeTableSubtree("test PaC component build", Ordered, Label("github-webhook", "pac-build", "pipeline", "image-controller"), func(gitProvider git.GitProvider, gitPrefix string) {
+		var applicationName, customDefaultComponentName, customBranchComponentName, componentBaseBranchName string
+		var pacBranchName, testNamespace, imageRepoName, pullRobotAccountName, pushRobotAccountName string
+		var helloWorldComponentGitSourceURL, customDefaultComponentBranch string
+		var component *appservice.Component
+		var plr *pipeline.PipelineRun
+
+		var timeout, interval time.Duration
+
+		var prNumber int
+		var prHeadSha string
+		var buildPipelineAnnotation map[string]string
+
+		var helloWorldRepository string
+
+		BeforeAll(func() {
+			if os.Getenv(constants.SKIP_PAC_TESTS_ENV) == "true" {
+				Skip("Skipping this test due to configuration issue with Spray proxy")
+			}
+
+			f, err = framework.NewFramework(utils.GetGeneratedNamespace("build-e2e"))
+			Expect(err).NotTo(HaveOccurred())
+			testNamespace = f.UserNamespace
+
+			if utils.IsPrivateHostname(f.OpenshiftConsoleHost) {
+				Skip("Using private cluster (not reachable from Github), skipping...")
+			}
+
+			quayOrg := utils.GetEnv("DEFAULT_QUAY_ORG", "")
+			supports, err := build.DoesQuayOrgSupportPrivateRepo()
+			Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("error while checking if quay org supports private repo: %+v", err))
+			if !supports {
+				if quayOrg == "redhat-appstudio-qe" {
+					Fail("Failed to create private image repo in redhat-appstudio-qe org")
+				} else {
+					Skip("Quay org does not support private quay repository creation, please add support for private repo creation before running this test")
+				}
+			}
+			Expect(err).ShouldNot(HaveOccurred())
+
+			applicationName = fmt.Sprintf("build-suite-test-application-%s", util.GenerateRandomString(4))
+			_, err = f.AsKubeAdmin.HasController.CreateApplication(applicationName, testNamespace)
+			Expect(err).NotTo(HaveOccurred())
+
+			customDefaultComponentName = fmt.Sprintf("%s-%s-%s", gitPrefix, "test-custom-default", util.GenerateRandomString(6))
+			customBranchComponentName = fmt.Sprintf("%s-%s-%s", gitPrefix, "test-custom-branch", util.GenerateRandomString(6))
+			pacBranchName = constants.PaCPullRequestBranchPrefix + customBranchComponentName
+			customDefaultComponentBranch = constants.PaCPullRequestBranchPrefix + customDefaultComponentName
+			componentBaseBranchName = fmt.Sprintf("base-%s", util.GenerateRandomString(6))
+
+			gitClient, helloWorldComponentGitSourceURL, helloWorldRepository = setupGitProvider(f, gitProvider)
+			// get the build pipeline bundle annotation
+			buildPipelineAnnotation = build.GetBuildPipelineBundleAnnotation(constants.DockerBuild)
+
+			err = gitClient.CreateBranch(helloWorldRepository, helloWorldComponentDefaultBranch, helloWorldComponentRevision, componentBaseBranchName)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		AfterAll(func() {
+			if !CurrentSpecReport().Failed() {
+				Expect(f.AsKubeAdmin.HasController.DeleteAllComponentsInASpecificNamespace(testNamespace, time.Minute*5)).To(Succeed())
+				Expect(f.AsKubeAdmin.HasController.DeleteAllApplicationsInASpecificNamespace(testNamespace, time.Minute*5)).To(Succeed())
+			}
+
+			err = gitClient.DeleteBranch(helloWorldRepository, pacBranchName)
+			if err != nil {
+				Expect(err.Error()).To(Or(ContainSubstring("Reference does not exist"), ContainSubstring("404")))
+			}
+			err = gitClient.DeleteBranch(helloWorldRepository, componentBaseBranchName)
+			if err != nil {
+				Expect(err.Error()).To(Or(ContainSubstring("Reference does not exist"), ContainSubstring("404")))
+			}
+
+			err := gitClient.DeleteBranchAndClosePullRequest(helloWorldRepository, prNumber)
+			if err != nil {
+				Expect(err.Error()).To(Or(ContainSubstring("Reference does not exist"), ContainSubstring("404")))
+			}
+
+			if gitProvider == git.GitLabProvider {
+				err = gitClient.CleanupWebhooks(strings.Split(helloWorldRepository, "/")[1], f.ClusterAppDomain)
+			} else {
+				err = gitClient.CleanupWebhooks(helloWorldRepository, f.ClusterAppDomain)
+			}
+			if err != nil {
+				Expect(err.Error()).To(ContainSubstring("404 Not Found"))
+			}
+		})
+
+		When("a new component without specified branch is created and with visibility private", Label("pac-custom-default-branch"), func() {
+			var componentObj appservice.ComponentSpec
+
+			BeforeAll(func() {
+				componentObj = appservice.ComponentSpec{
+					ComponentName: customDefaultComponentName,
+					Application:   applicationName,
+					Source: appservice.ComponentSource{
+						ComponentSourceUnion: appservice.ComponentSourceUnion{
+							GitSource: &appservice.GitSource{
+								URL:           helloWorldComponentGitSourceURL,
+								Revision:      "",
+								DockerfileURL: constants.DockerFilePath,
+							},
+						},
+					},
+				}
+
+				_, err = f.AsKubeAdmin.HasController.CreateComponent(componentObj, testNamespace, "", "", applicationName, false, utils.MergeMaps(utils.MergeMaps(constants.ComponentPaCRequestAnnotation, constants.ImageControllerAnnotationRequestPrivateRepo), buildPipelineAnnotation))
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+
+			It("correctly targets the default branch (that is not named 'main') with PaC", func() {
+				timeout = time.Second * 300
+				interval = time.Second * 1
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(helloWorldRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == customDefaultComponentBranch {
+							Expect(pr.TargetBranch).To(Equal(helloWorldComponentDefaultBranch))
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for init PaC PR to be created against %s branch in %s repository", helloWorldComponentDefaultBranch, helloWorldComponentGitSourceRepoName))
+			})
+
+			It("workspace parameter is set correctly in PaC repository CR", func() {
+				nsObj, err := f.AsKubeAdmin.CommonController.GetNamespace(testNamespace)
+				Expect(err).ShouldNot(HaveOccurred())
+				wsName := nsObj.Labels["appstudio.redhat.com/workspace_name"]
+				repositoryParams, err := f.AsKubeAdmin.TektonController.GetRepositoryParams(customDefaultComponentName, testNamespace)
+				Expect(err).ShouldNot(HaveOccurred(), "error while trying to get repository params")
+				paramExists := false
+				for _, param := range repositoryParams {
+					if param.Name == "appstudio_workspace" {
+						paramExists = true
+						Expect(param.Value).To(Equal(wsName), fmt.Sprintf("got workspace param value: %s, expected %s", param.Value, wsName))
+					}
+				}
+				Expect(paramExists).To(BeTrue(), "appstudio_workspace param does not exists in repository CR")
+
+			})
+			It("triggers a PipelineRun", func() {
+				timeout = time.Minute * 5
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customDefaultComponentName, applicationName, testNamespace, "")
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun has not been created yet for the component %s/%s\n", testNamespace, customBranchComponentName)
+						return err
+					}
+					if !plr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't started yet", plr.GetNamespace(), plr.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", customBranchComponentName, testNamespace))
+			})
+			It("build pipeline uses the correct serviceAccount", func() {
+				serviceAccountName := "build-pipeline-" + customDefaultComponentName
+				Expect(plr.Spec.TaskRunTemplate.ServiceAccountName).Should(Equal(serviceAccountName))
+			})
+			It("component build status is set correctly", func() {
+				var buildStatus *controllers.BuildStatus
+				Eventually(func() (bool, error) {
+					component, err := f.AsKubeAdmin.HasController.GetComponent(customDefaultComponentName, testNamespace)
+					if err != nil {
+						return false, err
+					}
+
+					buildStatusAnnotationValue := component.Annotations[controllers.BuildStatusAnnotationName]
+					GinkgoWriter.Printf(buildStatusAnnotationValueLoggingFormat, buildStatusAnnotationValue)
+					statusBytes := []byte(buildStatusAnnotationValue)
+
+					err = json.Unmarshal(statusBytes, &buildStatus)
+					if err != nil {
+						return false, err
+					}
+
+					if buildStatus.PaC != nil {
+						GinkgoWriter.Printf("state: %s\n", buildStatus.PaC.State)
+						GinkgoWriter.Printf("mergeUrl: %s\n", buildStatus.PaC.MergeUrl)
+						GinkgoWriter.Printf("errId: %d\n", buildStatus.PaC.ErrId)
+						GinkgoWriter.Printf("errMessage: %s\n", buildStatus.PaC.ErrMessage)
+						GinkgoWriter.Printf("configurationTime: %s\n", buildStatus.PaC.ConfigurationTime)
+					} else {
+						GinkgoWriter.Println("build status does not have PaC field")
+					}
+
+					return buildStatus.PaC != nil && buildStatus.PaC.State == "enabled" && buildStatus.PaC.MergeUrl != "" && buildStatus.PaC.ErrId == 0 && buildStatus.PaC.ConfigurationTime != "", nil
+				}, timeout, interval).Should(BeTrue(), "component build status has unexpected content")
+			})
+			It("image repo and robot account created successfully", func() {
+				imageRepoName, err = f.AsKubeAdmin.ImageController.GetImageName(testNamespace, customDefaultComponentName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed to read image repo for component %s", customDefaultComponentName)
+				Expect(imageRepoName).ShouldNot(BeEmpty(), "image repo name is empty")
+
+				imageExist, err := build.DoesImageRepoExistInQuay(imageRepoName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if image repo exists in quay with error: %+v", err)
+				Expect(imageExist).To(BeTrue(), "quay image does not exists")
+
+				pullRobotAccountName, pushRobotAccountName, err = f.AsKubeAdmin.ImageController.GetRobotAccounts(testNamespace, customDefaultComponentName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed to get robot account names")
+				pullRobotAccountExist, err := build.DoesRobotAccountExistInQuay(pullRobotAccountName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if pull robot account exists in quay with error: %+v", err)
+				Expect(pullRobotAccountExist).To(BeTrue(), "pull robot account does not exists in quay")
+				pushRobotAccountExist, err := build.DoesRobotAccountExistInQuay(pushRobotAccountName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if push robot account exists in quay with error: %+v", err)
+				Expect(pushRobotAccountExist).To(BeTrue(), "push robot account does not exists in quay")
+			})
+			It("created image repo is private", func() {
+				isPublic, err := build.IsImageRepoPublic(imageRepoName)
+				Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("failed while checking if the image repo %s is private", imageRepoName))
+				Expect(isPublic).To(BeFalse(), "Expected image repo to be private, but it is public")
+			})
+
+			It("a related PipelineRun should be deleted after deleting the component", func() {
+				timeout = time.Second * 180
+				interval = time.Second * 5
+				Expect(f.AsKubeAdmin.HasController.DeleteComponent(customDefaultComponentName, testNamespace, true)).To(Succeed())
+				// Test removal of PipelineRun
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customDefaultComponentName, applicationName, testNamespace, "")
+					if err == nil {
+						return fmt.Errorf("pipelinerun %s/%s is not removed yet", plr.GetNamespace(), plr.GetName())
+					}
+					return err
+				}, timeout, interval).Should(MatchError(ContainSubstring("no pipelinerun found")), fmt.Sprintf("timed out when waiting for the PipelineRun to be removed for Component %s/%s", testNamespace, customBranchComponentName))
+			})
+
+			It("PR branch should not exist in the repo", func() {
+				timeout = time.Second * 60
+				interval = time.Second * 1
+				Eventually(func() bool {
+					exists, err := gitClient.BranchExists(helloWorldRepository, customDefaultComponentBranch)
+					Expect(err).ShouldNot(HaveOccurred())
+					return exists
+				}, timeout, interval).Should(BeFalse(), fmt.Sprintf("timed out when waiting for the branch %s to be deleted from %s repository", customDefaultComponentBranch, helloWorldComponentGitSourceRepoName))
+			})
+
+			It("related image repo and the robot account should be deleted after deleting the component", func() {
+				timeout = time.Second * 60
+				interval = time.Second * 1
+				// Check image repo should be deleted
+				Eventually(func() (bool, error) {
+					return build.DoesImageRepoExistInQuay(imageRepoName)
+				}, timeout, interval).Should(BeFalse(), fmt.Sprintf("timed out when waiting for image repo %s to be deleted", imageRepoName))
+
+				// Check robot account should be deleted
+				Eventually(func() (bool, error) {
+					pullRobotAccountExists, err := build.DoesRobotAccountExistInQuay(pullRobotAccountName)
+					if err != nil {
+						return false, err
+					}
+					pushRobotAccountExists, err := build.DoesRobotAccountExistInQuay(pushRobotAccountName)
+					if err != nil {
+						return false, err
+					}
+					return pullRobotAccountExists || pushRobotAccountExists, nil
+				}, timeout, interval).Should(BeFalse(), fmt.Sprintf("timed out when checking if robot accounts %s and %s got deleted", pullRobotAccountName, pushRobotAccountName))
+
+			})
+		})
+
+		When("a new Component with specified custom branch is created", Label("build-custom-branch"), func() {
+			var outputImage string
+			var componentObj appservice.ComponentSpec
+
+			BeforeAll(func() {
+				componentObj = appservice.ComponentSpec{
+					ComponentName: customBranchComponentName,
+					Application:   applicationName,
+					Source: appservice.ComponentSource{
+						ComponentSourceUnion: appservice.ComponentSourceUnion{
+							GitSource: &appservice.GitSource{
+								URL:           helloWorldComponentGitSourceURL,
+								Revision:      componentBaseBranchName,
+								DockerfileURL: constants.DockerFilePath,
+							},
+						},
+					},
+				}
+				// Create a component with Git Source URL, a specified git branch and marking delete-repo=true
+				component, err = f.AsKubeAdmin.HasController.CreateComponent(componentObj, testNamespace, "", "", applicationName, false, utils.MergeMaps(utils.MergeMaps(constants.ComponentPaCRequestAnnotation, constants.ImageControllerAnnotationRequestPublicRepo), buildPipelineAnnotation))
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+
+			It("triggers a PipelineRun", func() {
+				timeout = time.Second * 600
+				interval = time.Second * 1
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, "")
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun has not been created yet for the component %s/%s\n", testNamespace, customBranchComponentName)
+						return err
+					}
+					if !plr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't started yet", plr.GetNamespace(), plr.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", testNamespace, customBranchComponentName))
+			})
+			It("should lead to a PaC init PR creation", func() {
+				timeout = time.Second * 300
+				interval = time.Second * 1
+
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(helloWorldRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == pacBranchName {
+							prNumber = pr.Number
+							prHeadSha = pr.HeadSHA
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for init PaC PR (branch name '%s') to be created in %s repository", pacBranchName, helloWorldComponentGitSourceRepoName))
+			})
+			It("the PipelineRun should eventually finish successfully", func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(component, "", "", "",
+					f.AsKubeAdmin.TektonController, &has.RetryOptions{Retries: 2, Always: true}, plr)).To(Succeed())
+				// in case the first pipelineRun attempt has failed and was retried, we need to update the git branch head ref
+				prHeadSha = plr.Labels["pipelinesascode.tekton.dev/sha"]
+			})
+			It("image repo and robot account created successfully", func() {
+				imageRepoName, err = f.AsKubeAdmin.ImageController.GetImageName(testNamespace, customBranchComponentName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed to read image repo for component %s", customBranchComponentName)
+				Expect(imageRepoName).ShouldNot(BeEmpty(), "image repo name is empty")
+
+				imageExist, err := build.DoesImageRepoExistInQuay(imageRepoName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if image repo exists in quay with error: %+v", err)
+				Expect(imageExist).To(BeTrue(), "quay image does not exists")
+
+				pullRobotAccountName, pushRobotAccountName, err = f.AsKubeAdmin.ImageController.GetRobotAccounts(testNamespace, customBranchComponentName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed to get robot account names")
+				pullRobotAccountExist, err := build.DoesRobotAccountExistInQuay(pullRobotAccountName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if pull robot account exists in quay with error: %+v", err)
+				Expect(pullRobotAccountExist).To(BeTrue(), "pull robot account does not exists in quay")
+				pushRobotAccountExist, err := build.DoesRobotAccountExistInQuay(pushRobotAccountName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed while checking if push robot account exists in quay with error: %+v", err)
+				Expect(pushRobotAccountExist).To(BeTrue(), "push robot account does not exists in quay")
+
+			})
+			It("floating tags are created successfully", func() {
+				builtImage := build.GetBinaryImage(plr)
+				Expect(builtImage).ToNot(BeEmpty(), "built image url is empty")
+				builtImageRef, err := reference.Parse(builtImage)
+				Expect(err).ShouldNot(HaveOccurred(),
+					fmt.Sprintf("cannot parse image pullspec: %s", builtImage))
+				for _, tagName := range additionalTags {
+					_, err := build.GetImageTag(builtImageRef.Namespace, builtImageRef.Name, tagName)
+					Expect(err).ShouldNot(HaveOccurred(),
+						fmt.Sprintf("failed to get tag %s from image repo", tagName),
+					)
+				}
+			})
+			It("created image repo is public", func() {
+				isPublic, err := build.IsImageRepoPublic(imageRepoName)
+				Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("failed while checking if the image repo %s is public", imageRepoName))
+				Expect(isPublic).To(BeTrue(), fmt.Sprintf("Expected image repo '%s' to be changed to public, but it is private", imageRepoName))
+			})
+
+			It("image tag is updated successfully", func() {
+				// check if the image tag exists in quay
+				// ✅ CORRECT: Use the prHeadSha to get the specific successful PipelineRun
+				plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, prHeadSha)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				for _, p := range plr.Spec.Params {
+					if p.Name == "output-image" {
+						outputImage = p.Value.StringVal
+					}
+				}
+				Expect(outputImage).ToNot(BeEmpty(), "output image %s of the component could not be found", outputImage)
+
+				// Wait for image to be pushed to Quay - there can be a delay after PipelineRun completion
+				Eventually(func() bool {
+					isExists, err := build.DoesTagExistsInQuay(outputImage)
+					if err != nil {
+						GinkgoWriter.Printf("Error checking if image tag exists in Quay: %v\n", err)
+						return false
+					}
+					if !isExists {
+						GinkgoWriter.Printf("Image tag %s not yet available in Quay, retrying...\n", outputImage)
+					} else {
+						GinkgoWriter.Printf("Image tag %s successfully found in Quay\n", outputImage)
+					}
+					return isExists
+				}, time.Minute*3, time.Second*10).Should(BeTrue(), fmt.Sprintf("image tag %s does not exist in quay after timeout", outputImage))
+			})
+
+			It("should ensure pruning labels are set", func() {
+				plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, "")
+				Expect(err).ShouldNot(HaveOccurred())
+
+				image, err := build.ImageFromPipelineRun(plr)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				labels := image.Config.Config.Labels
+				Expect(labels).ToNot(BeEmpty())
+
+				expiration, ok := labels["quay.expires-after"]
+				Expect(ok).To(BeTrue())
+				Expect(expiration).To(Equal(utils.GetEnv(constants.IMAGE_TAG_EXPIRATION_ENV, constants.DefaultImageTagExpiration)))
+			})
+			It("eventually leads to the PipelineRun status report at Checks tab", func() {
+				switch gitProvider {
+				case git.GitHubProvider:
+					expectedCheckRunName := fmt.Sprintf("%s-%s", customBranchComponentName, "on-pull-request")
+					Expect(f.AsKubeAdmin.CommonController.Github.GetCheckRunConclusion(expectedCheckRunName, helloWorldComponentGitSourceRepoName, prHeadSha, prNumber)).To(Equal(constants.CheckrunConclusionSuccess))
+				case git.GitLabProvider:
+					expectedStatusName := fmt.Sprintf("%s-%s", customBranchComponentName, "on-pull-request")
+					Expect(f.AsKubeAdmin.HasController.GitLab.GetCommitStatusConclusion(expectedStatusName, helloWorldComponentGitLabProjectID, prHeadSha, prNumber)).To(Equal(constants.CheckrunConclusionSuccess))
+				}
+			})
+		})
+
+		When("the PaC init branch is updated", Label("build-custom-branch"), func() {
+			var createdFileSHA string
+
+			BeforeAll(func() {
+				fileToCreatePath := fmt.Sprintf(".tekton/%s-readme.md", customBranchComponentName)
+
+				createdFile, err := gitClient.CreateFile(helloWorldRepository, fileToCreatePath, fmt.Sprintf("test PaC branch %s update", pacBranchName), pacBranchName)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				createdFileSHA = createdFile.CommitSHA
+				GinkgoWriter.Println("created file sha:", createdFileSHA)
+			})
+
+			It("eventually leads to triggering another PipelineRun", func() {
+				timeout = time.Minute * 5
+
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, createdFileSHA)
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun has not been created yet for the component %s/%s\n", testNamespace, customBranchComponentName)
+						return err
+					}
+					if !plr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't started yet", plr.GetNamespace(), plr.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", testNamespace, customBranchComponentName))
+			})
+			It("should lead to a PaC init PR update", func() {
+				timeout = time.Second * 300
+				interval = time.Second * 1
+
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(helloWorldRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == pacBranchName {
+							Expect(prHeadSha).NotTo(Equal(pr.HeadSHA))
+							prNumber = pr.Number
+							prHeadSha = pr.HeadSHA
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for init PaC PR (branch name '%s') to be created in %s repository", pacBranchName, helloWorldComponentGitSourceRepoName))
+			})
+			It("PipelineRun should eventually finish", func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(component, "", createdFileSHA, "",
+					f.AsKubeAdmin.TektonController, &has.RetryOptions{Retries: 2, Always: true}, plr)).To(Succeed())
+				// in case the first pipelineRun attempt has failed and was retried, we need to update the git branch head ref
+				createdFileSHA = plr.Labels["pipelinesascode.tekton.dev/sha"]
+			})
+			It("eventually leads to another update of a PR about the PipelineRun status report at Checks tab", func() {
+				switch gitProvider {
+				case git.GitHubProvider:
+					expectedCheckRunName := fmt.Sprintf("%s-%s", customBranchComponentName, "on-pull-request")
+					Expect(f.AsKubeAdmin.CommonController.Github.GetCheckRunConclusion(expectedCheckRunName, helloWorldComponentGitSourceRepoName, createdFileSHA, prNumber)).To(Equal(constants.CheckrunConclusionSuccess))
+				case git.GitLabProvider:
+					expectedStatusName := fmt.Sprintf("%s-%s", customBranchComponentName, "on-pull-request")
+					Expect(f.AsKubeAdmin.HasController.GitLab.GetCommitStatusConclusion(expectedStatusName, helloWorldComponentGitLabProjectID, createdFileSHA, prNumber)).To(Equal(constants.CheckrunConclusionSuccess))
+				}
+			})
+		})
+
+		When("the PaC init branch is merged", Label("build-custom-branch"), func() {
+			var mergeResult *git.PullRequest
+			var mergeResultSha string
+
+			BeforeAll(func() {
+				Eventually(func() error {
+					mergeResult, err = gitClient.MergePullRequest(helloWorldRepository, prNumber)
+					return err
+				}, time.Minute).ShouldNot(HaveOccurred(), fmt.Sprintf("error when merging PaC pull request #%d in repo %s", prNumber, helloWorldComponentGitSourceRepoName))
+
+				mergeResultSha = mergeResult.MergeCommitSHA
+				GinkgoWriter.Println("merged result sha:", mergeResultSha)
+			})
+
+			It("eventually leads to triggering another PipelineRun", func() {
+				timeout = time.Minute * 10
+
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, mergeResultSha)
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun has not been created yet for the component %s/%s\n", testNamespace, customBranchComponentName)
+						return err
+					}
+					if !plr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't started yet", plr.GetNamespace(), plr.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", testNamespace, customBranchComponentName))
+			})
+
+			It("pipelineRun should eventually finish", func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(component, "",
+					mergeResultSha, "", f.AsKubeAdmin.TektonController, &has.RetryOptions{Retries: 2, Always: true}, plr)).To(Succeed())
+				mergeResultSha = plr.Labels["pipelinesascode.tekton.dev/sha"]
+			})
+
+			It("does not have expiration set", func() {
+				image, err := build.ImageFromPipelineRun(plr)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				labels := image.Config.Config.Labels
+				Expect(labels).ToNot(BeEmpty())
+
+				expiration, ok := labels["quay.expires-after"]
+				Expect(ok).To(BeFalse())
+				Expect(expiration).To(BeEmpty())
+			})
+
+			It("After updating image visibility to private, it should not trigger another PipelineRun", func() {
+				Expect(f.AsKubeAdmin.TektonController.DeleteAllPipelineRunsInASpecificNamespace(testNamespace)).To(Succeed())
+				// Wait for one minute so that all the pipelineruns deleted successfully
+				Eventually(func() bool {
+					componentPipelineRun, _ := f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, "")
+					if componentPipelineRun != nil {
+						GinkgoWriter.Printf("found pipelinerun: %s\n", componentPipelineRun.GetName())
+					}
+					return componentPipelineRun == nil
+				}, time.Minute*3, time.Second*5).Should(BeTrue(), "all the pipelineruns are not deleted, still some pipelineruns exists")
+
+				Eventually(func() error {
+					_, err := f.AsKubeAdmin.ImageController.ChangeVisibilityToPrivate(testNamespace, applicationName, customBranchComponentName)
+					if err != nil {
+						GinkgoWriter.Printf("failed to change visibility to private with error %v\n", err)
+						return err
+					}
+					return nil
+				}, time.Second*20, time.Second*1).Should(Succeed(), fmt.Sprintf("timed out when trying to change visibility of the image repos to private in %s/%s", testNamespace, customBranchComponentName))
+
+				GinkgoWriter.Printf("waiting for one minute and expecting to not trigger a PipelineRun")
+				Consistently(func() bool {
+					componentPipelineRun, _ := f.AsKubeAdmin.HasController.GetComponentPipelineRun(customBranchComponentName, applicationName, testNamespace, "")
+					if componentPipelineRun != nil {
+						GinkgoWriter.Printf("While waiting for no pipeline to be triggered, found Pipelinerun: %s\n", componentPipelineRun.GetName())
+					}
+					return componentPipelineRun == nil
+				}, 2*time.Minute, constants.PipelineRunPollingInterval).Should(BeTrue(), fmt.Sprintf("expected no PipelineRun to be triggered for the component %s in %s namespace", customBranchComponentName, testNamespace))
+			})
+			It("image repo is updated to private", func() {
+				isPublic, err := build.IsImageRepoPublic(imageRepoName)
+				Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("failed while checking if the image repo %s is private", imageRepoName))
+				Expect(isPublic).To(BeFalse(), "Expected image repo to changed to private, but it is public")
+			})
+			It("retrigger the pipeline manually", func() {
+				Expect(f.AsKubeAdmin.HasController.SetComponentAnnotation(customBranchComponentName, controllers.BuildRequestAnnotationName, controllers.BuildRequestTriggerPaCBuildAnnotationValue, testNamespace)).To(Succeed())
+				// Check the pipelinerun is triggered
+				Eventually(func() error {
+					plr, err = f.AsKubeAdmin.HasController.GetComponentPipelineRunWithType(customBranchComponentName, applicationName, testNamespace, "build", "", "incoming")
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun is not been retriggered yet for the component %s/%s\n", testNamespace, customBranchComponentName)
+						return err
+					}
+					if !plr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't been started yet", plr.GetNamespace(), plr.GetName())
+					}
+					return nil
+				}, 10*time.Minute, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to retrigger for the component %s/%s", testNamespace, customBranchComponentName))
+			})
+			It("retriggered pipelineRun should eventually finish", func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(component, "build", "", "incoming", f.AsKubeAdmin.TektonController, &has.RetryOptions{Retries: 2, Always: true}, plr)).To(Succeed())
+			})
+		})
+
+		When("the component is removed and recreated (with the same name in the same namespace)", Label("build-custom-branch"), func() {
+			var componentObj appservice.ComponentSpec
+
+			BeforeAll(func() {
+				Expect(f.AsKubeAdmin.HasController.DeleteComponent(customBranchComponentName, testNamespace, true)).To(Succeed())
+
+				timeout = 1 * time.Minute
+				interval = 1 * time.Second
+				Eventually(func() bool {
+					_, err := f.AsKubeAdmin.HasController.GetComponent(customBranchComponentName, testNamespace)
+					return k8sErrors.IsNotFound(err)
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for the app %s/%s to be deleted", testNamespace, applicationName))
+				// Check removal of image repo
+				Eventually(func() (bool, error) {
+					return build.DoesImageRepoExistInQuay(imageRepoName)
+				}, timeout, interval).Should(BeFalse(), fmt.Sprintf("timed out when waiting for image repo %s to be deleted", imageRepoName))
+				// Check removal of robot accounts
+				Eventually(func() (bool, error) {
+					pullRobotAccountExists, err := build.DoesRobotAccountExistInQuay(pullRobotAccountName)
+					if err != nil {
+						return false, err
+					}
+					pushRobotAccountExists, err := build.DoesRobotAccountExistInQuay(pushRobotAccountName)
+					if err != nil {
+						return false, err
+					}
+					return pullRobotAccountExists || pushRobotAccountExists, nil
+				}, timeout, interval).Should(BeFalse(), fmt.Sprintf("timed out when checking if robot accounts %s and %s got deleted", pullRobotAccountName, pushRobotAccountName))
+			})
+
+			BeforeAll(func() {
+				componentObj = appservice.ComponentSpec{
+					ComponentName: customBranchComponentName,
+					Source: appservice.ComponentSource{
+						ComponentSourceUnion: appservice.ComponentSourceUnion{
+							GitSource: &appservice.GitSource{
+								URL:           helloWorldComponentGitSourceURL,
+								Revision:      componentBaseBranchName,
+								DockerfileURL: constants.DockerFilePath,
+							},
+						},
+					},
+				}
+
+				_, err = f.AsKubeAdmin.HasController.CreateComponent(componentObj, testNamespace, "", "", applicationName, false, utils.MergeMaps(utils.MergeMaps(constants.ComponentPaCRequestAnnotation, constants.ImageControllerAnnotationRequestPublicRepo), buildPipelineAnnotation))
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+
+			It("should no longer lead to a creation of a PaC PR", func() {
+				timeout = time.Second * 10
+				interval = time.Second * 2
+				Consistently(func() error {
+					prs, err := gitClient.ListPullRequests(helloWorldRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == pacBranchName {
+							return fmt.Errorf("did not expect a new PR created in %s repository after initial PaC configuration was already merged for the same component name and a namespace", helloWorldRepository)
+						}
+					}
+					return nil
+				}, timeout, interval).ShouldNot(HaveOccurred())
+			})
+		})
+	},
+		//Entry("github", git.GitHubProvider, "gh"),
 		Entry("gitlab", git.GitLabProvider, "gl"),
 	)
 
@@ -1648,6 +2301,388 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 		})
 	},
 		Entry("github", git.GitHubProvider, "gh"),
+		//Entry("gitlab", git.GitLabProvider, "gl"),
+	)
+	DescribeTableSubtree("test of component update with renovate", Ordered, Label("renovate", "multi-component"), func(gitProvider git.GitProvider, gitPrefix string) {
+		type multiComponent struct {
+			repoName        string
+			baseBranch      string
+			componentBranch string
+			baseRevision    string
+			componentName   string
+			gitRepo         string
+			pacBranchName   string
+			component       *appservice.Component
+		}
+
+		ChildComponentDef := multiComponent{repoName: componentDependenciesChildRepoName, baseRevision: componentDependenciesChildGitRevision, baseBranch: componentDependenciesChildDefaultBranch}
+		ParentComponentDef := multiComponent{repoName: componentDependenciesParentRepoName, baseRevision: componentDependenciesParentGitRevision, baseBranch: componentDependenciesParentDefaultBranch}
+		components := []*multiComponent{&ChildComponentDef, &ParentComponentDef}
+		var applicationName, testNamespace, mergeResultSha, imageRepoName string
+		var prNumber int
+		var mergeResult *git.PullRequest
+		var timeout time.Duration
+		var parentFirstDigest string
+		var parentPostPacMergeDigest string
+		var parentImageNameWithNoDigest string
+		const distributionRepository = "quay.io/redhat-appstudio-qe/release-repository"
+		quayOrg := utils.GetEnv("DEFAULT_QUAY_ORG", "")
+		var parentRepository, childRepository string
+
+		var managedNamespace string
+		var buildPipelineAnnotation map[string]string
+
+		var gitClient git.Client
+		var componentDependenciesChildRepository string
+
+		BeforeAll(func() {
+			f, err = framework.NewFramework(utils.GetGeneratedNamespace("build-e2e"))
+			Expect(err).NotTo(HaveOccurred())
+			testNamespace = f.UserNamespace
+
+			applicationName = fmt.Sprintf("build-suite-component-update-%s", util.GenerateRandomString(4))
+			_, err = f.AsKubeAdmin.HasController.CreateApplication(applicationName, testNamespace)
+			Expect(err).NotTo(HaveOccurred())
+			branchString := util.GenerateRandomString(4)
+			ParentComponentDef.componentBranch = fmt.Sprintf("multi-component-parent-base-%s", branchString)
+			ChildComponentDef.componentBranch = fmt.Sprintf("multi-component-child-base-%s", branchString)
+			switch gitProvider {
+			case git.GitHubProvider:
+				gitClient = git.NewGitHubClient(f.AsKubeAdmin.CommonController.Github)
+
+				ParentComponentDef.gitRepo = fmt.Sprintf(githubUrlFormat, githubOrg, ParentComponentDef.repoName)
+				parentRepository = ParentComponentDef.repoName
+
+				ChildComponentDef.gitRepo = fmt.Sprintf(githubUrlFormat, githubOrg, ChildComponentDef.repoName)
+				childRepository = ChildComponentDef.repoName
+
+				componentDependenciesChildRepository = componentDependenciesChildRepoName
+			case git.GitLabProvider:
+				gitClient = git.NewGitlabClient(f.AsKubeAdmin.CommonController.Gitlab)
+
+				parentRepository = fmt.Sprintf("%s/%s", gitlabOrg, ParentComponentDef.repoName)
+				ParentComponentDef.gitRepo = fmt.Sprintf(gitlabUrlFormat, parentRepository)
+
+				childRepository = fmt.Sprintf("%s/%s", gitlabOrg, ChildComponentDef.repoName)
+				ChildComponentDef.gitRepo = fmt.Sprintf(gitlabUrlFormat, childRepository)
+
+				componentDependenciesChildRepository = fmt.Sprintf("%s/%s", gitlabOrg, componentDependenciesChildRepoName)
+			}
+			ParentComponentDef.componentName = fmt.Sprintf("%s-multi-component-parent-%s", gitPrefix, branchString)
+			ChildComponentDef.componentName = fmt.Sprintf("%s-multi-component-child-%s", gitPrefix, branchString)
+			ParentComponentDef.pacBranchName = constants.PaCPullRequestBranchPrefix + ParentComponentDef.componentName
+			ChildComponentDef.pacBranchName = constants.PaCPullRequestBranchPrefix + ChildComponentDef.componentName
+
+			err = gitClient.CreateBranch(parentRepository, ParentComponentDef.baseBranch, ParentComponentDef.baseRevision, ParentComponentDef.componentBranch)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = gitClient.CreateBranch(childRepository, ChildComponentDef.baseBranch, ChildComponentDef.baseRevision, ChildComponentDef.componentBranch)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Also setup a release namespace so we can test nudging of distribution repository images
+			managedNamespace = testNamespace + "-managed"
+			_, err = f.AsKubeAdmin.CommonController.CreateTestNamespace(managedNamespace)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// We just need the ReleaseAdmissionPlan to contain a mapping between component and distribution repositories
+			data := struct {
+				Mapping struct {
+					Components []struct {
+						Name       string
+						Repository string
+					}
+				}
+			}{}
+			data.Mapping.Components = append(data.Mapping.Components, struct {
+				Name       string
+				Repository string
+			}{Name: ParentComponentDef.componentName, Repository: distributionRepository})
+			rawData, err := json.Marshal(&data)
+			Expect(err).NotTo(HaveOccurred())
+
+			GinkgoWriter.Printf("ReleaseAdmissionPlan data: %s", string(rawData))
+			managedServiceAccount, err := f.AsKubeAdmin.CommonController.CreateServiceAccount("release-service-account", managedNamespace, nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = f.AsKubeAdmin.ReleaseController.CreateReleasePipelineRoleBindingForServiceAccount(managedNamespace, managedServiceAccount)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = f.AsKubeAdmin.ReleaseController.CreateReleasePlanAdmission("demo", managedNamespace, "", f.UserNamespace, "demo", "release-service-account", []string{applicationName}, true, &tektonutils.PipelineRef{
+				Resolver: "git",
+				Params: []tektonutils.Param{
+					{Name: "url", Value: constants.RELEASE_CATALOG_DEFAULT_URL},
+					{Name: "revision", Value: constants.RELEASE_CATALOG_DEFAULT_REVISION},
+					{Name: "pathInRepo", Value: "pipelines/managed/e2e/e2e.yaml"},
+				}}, &runtime.RawExtension{Raw: rawData})
+			Expect(err).NotTo(HaveOccurred())
+
+			// get the build pipeline bundle annotation
+			buildPipelineAnnotation = build.GetBuildPipelineBundleAnnotation(constants.DockerBuild)
+
+			if gitProvider == git.GitLabProvider {
+				gitlabToken := utils.GetEnv(constants.GITLAB_BOT_TOKEN_ENV, "")
+				Expect(gitlabToken).ShouldNot(BeEmpty())
+
+				secretAnnotations := map[string]string{}
+
+				err = build.CreateGitlabBuildSecret(f, "pipelines-as-code-secret", secretAnnotations, gitlabToken)
+				Expect(err).ShouldNot(HaveOccurred())
+			}
+		})
+
+		AfterAll(func() {
+			if !CurrentSpecReport().Failed() {
+				Expect(f.AsKubeAdmin.HasController.DeleteComponent(ParentComponentDef.componentName, testNamespace, true)).To(Succeed())
+				Expect(f.AsKubeAdmin.HasController.DeleteComponent(ChildComponentDef.componentName, testNamespace, true)).To(Succeed())
+				Expect(f.AsKubeAdmin.HasController.DeleteApplication(applicationName, testNamespace, false)).To(Succeed())
+			}
+			Expect(f.AsKubeAdmin.CommonController.DeleteNamespace(managedNamespace)).ShouldNot(HaveOccurred())
+
+			repositories := []string{childRepository, parentRepository}
+			// Delete new branches created by renovate and a testing branch used as a component's base branch
+			for i, c := range components {
+				println("deleting branch " + c.componentBranch)
+				err = gitClient.DeleteBranch(repositories[i], c.componentBranch)
+				if err != nil {
+					Expect(err.Error()).To(Or(ContainSubstring("Reference does not exist"), ContainSubstring("Branch Not Found")))
+				}
+				err = gitClient.DeleteBranch(repositories[i], c.pacBranchName)
+				if err != nil {
+					Expect(err.Error()).To(Or(ContainSubstring("Reference does not exist"), ContainSubstring("Branch Not Found")))
+				}
+				// Cleanup parent repo webhooks
+				err = gitClient.CleanupWebhooks(componentDependenciesParentRepoName, f.ClusterAppDomain)
+				if err != nil {
+					Expect(err.Error()).To(ContainSubstring("404 Not Found"))
+				}
+
+				// Cleanup child repo webhooks
+				err = gitClient.CleanupWebhooks(componentDependenciesChildRepoName, f.ClusterAppDomain)
+				if err != nil {
+					Expect(err.Error()).To(ContainSubstring("404 Not Found"))
+				}
+			}
+		})
+
+		When("components are created in same namespace", func() {
+
+			It("creates component with nudges", func() {
+				for _, comp := range components {
+					componentObj := appservice.ComponentSpec{
+						ComponentName: comp.componentName,
+						Application:   applicationName,
+						Source: appservice.ComponentSource{
+							ComponentSourceUnion: appservice.ComponentSourceUnion{
+								GitSource: &appservice.GitSource{
+									URL:           comp.gitRepo,
+									Revision:      comp.componentBranch,
+									DockerfileURL: "Dockerfile",
+								},
+							},
+						},
+					}
+					//make the parent repo nudge the child repo
+					if comp.repoName == componentDependenciesParentRepoName {
+						componentObj.BuildNudgesRef = []string{ChildComponentDef.componentName}
+					}
+					comp.component, err = f.AsKubeAdmin.HasController.CreateComponent(componentObj, testNamespace, "", "", applicationName, true, utils.MergeMaps(utils.MergeMaps(constants.ComponentPaCRequestAnnotation, constants.ImageControllerAnnotationRequestPublicRepo), buildPipelineAnnotation))
+					Expect(err).ShouldNot(HaveOccurred())
+				}
+			})
+			// Initial pipeline run, we need this so we have an initial image that we can then update
+			It(fmt.Sprintf("triggers a PipelineRun for parent component %s", ParentComponentDef.componentName), func() {
+				timeout = time.Minute * 5
+
+				Eventually(func() error {
+					pr, err := f.AsKubeAdmin.HasController.GetComponentPipelineRun(ParentComponentDef.componentName, applicationName, testNamespace, "")
+					if err != nil {
+						GinkgoWriter.Printf("PipelineRun has not been created yet for the component %s/%s\n", testNamespace, ParentComponentDef.componentName)
+						return err
+					}
+					if !pr.HasStarted() {
+						return fmt.Errorf("pipelinerun %s/%s hasn't started yet", pr.GetNamespace(), pr.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", ParentComponentDef.componentName, testNamespace))
+			})
+			It(fmt.Sprintf("the PipelineRun should eventually finish successfully for parent component %s", ParentComponentDef.componentName), func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(ParentComponentDef.component, "", "", "", f.AsKubeAdmin.TektonController, &has.RetryOptions{Always: true, Retries: 2}, nil)).To(Succeed())
+				pr, err := f.AsKubeAdmin.HasController.GetComponentPipelineRun(ParentComponentDef.component.GetName(), ParentComponentDef.component.Spec.Application, ParentComponentDef.component.GetNamespace(), "")
+				Expect(err).ShouldNot(HaveOccurred())
+				for _, result := range pr.Status.PipelineRunStatusFields.Results {
+					if result.Name == "IMAGE_DIGEST" {
+						parentFirstDigest = result.Value.StringVal
+					}
+				}
+				Expect(parentFirstDigest).ShouldNot(BeEmpty(), fmt.Sprintf("pipelinerun status results: %v", pr.Status.PipelineRunStatusFields.Results))
+			})
+
+			It(fmt.Sprintf("the PipelineRun should eventually finish successfully for child component %s", ChildComponentDef.componentName), func() {
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(ChildComponentDef.component, "", "", "", f.AsKubeAdmin.TektonController, &has.RetryOptions{Always: true, Retries: 2}, nil)).To(Succeed())
+			})
+
+			It(fmt.Sprintf("should lead to a PaC PR creation for child component %s", ChildComponentDef.componentName), func() {
+				timeout = time.Second * 300
+				interval := time.Second * 1
+
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(childRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == ChildComponentDef.pacBranchName {
+							prNumber = pr.Number
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for PaC PR (branch name '%s') to be created in %s repository", ChildComponentDef.pacBranchName, ChildComponentDef.repoName))
+			})
+
+			It(fmt.Sprintf("Merging the PaC PR should be successful for child component %s", ChildComponentDef.componentName), func() {
+				Eventually(func() error {
+					mergeResult, err = gitClient.MergePullRequest(childRepository, prNumber)
+					return err
+				}, time.Minute).ShouldNot(HaveOccurred(), fmt.Sprintf("error when merging PaC pull request #%d in repo %s", prNumber, ChildComponentDef.repoName))
+
+				mergeResultSha = mergeResult.MergeCommitSHA
+				GinkgoWriter.Printf("merged result sha: %s for PR #%d\n", mergeResultSha, prNumber)
+			})
+			// Now we have an initial image we create a dockerfile in the child that references this new image
+			// This is the file that will be updated by the nudge
+			It("create dockerfile and yaml manifest that references build and distribution repositories", func() {
+
+				imageRepoName, err = f.AsKubeAdmin.ImageController.GetImageName(testNamespace, ParentComponentDef.componentName)
+				Expect(err).ShouldNot(HaveOccurred(), "failed to read image repo for component %s", ParentComponentDef.componentName)
+				Expect(imageRepoName).ShouldNot(BeEmpty(), "image repo name is empty")
+
+				parentImageNameWithNoDigest = "quay.io/" + quayOrg + "/" + imageRepoName
+				_, err = gitClient.CreateFile(childRepository, "Dockerfile.tmp", "FROM "+parentImageNameWithNoDigest+"@"+parentFirstDigest+"\nRUN echo hello\n", ChildComponentDef.pacBranchName)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				_, err = gitClient.CreateFile(childRepository, "manifest.yaml", "image: "+distributionRepository+"@"+parentFirstDigest, ChildComponentDef.pacBranchName)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				_, err = gitClient.CreatePullRequest(childRepository, "updated to build repo image", "update to build repo image", ChildComponentDef.pacBranchName, ChildComponentDef.componentBranch)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				prs, err := gitClient.ListPullRequests(childRepository)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				prno := -1
+				for _, pr := range prs {
+					if pr.SourceBranch == ChildComponentDef.pacBranchName {
+						prno = pr.Number
+					}
+				}
+				Expect(prno).ShouldNot(Equal(-1))
+
+				// GitLab merge fails if the pipeline run has not finished
+				Eventually(func() error {
+					_, err = gitClient.MergePullRequest(childRepository, prno)
+					return err
+				}, 10*time.Minute, time.Minute).ShouldNot(HaveOccurred(), fmt.Sprintf("unable to merge PR #%d in %s", prno, ChildComponentDef.repoName))
+
+			})
+			// This actually happens immediately, but we only need the PR number now
+			It(fmt.Sprintf("should lead to a PaC PR creation for parent component %s", ParentComponentDef.componentName), func() {
+				timeout = time.Second * 300
+				interval := time.Second * 1
+
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(parentRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if pr.SourceBranch == ParentComponentDef.pacBranchName {
+							prNumber = pr.Number
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for PaC PR (branch name '%s') to be created in %s repository", ParentComponentDef.pacBranchName, ParentComponentDef.repoName))
+			})
+			It(fmt.Sprintf("Merging the PaC PR should be successful for parent component %s", ParentComponentDef.componentName), func() {
+				Eventually(func() error {
+					mergeResult, err = gitClient.MergePullRequest(parentRepository, prNumber)
+					return err
+				}, time.Minute).ShouldNot(HaveOccurred(), fmt.Sprintf("error when merging PaC pull request #%d in repo %s", prNumber, ParentComponentDef.repoName))
+
+				mergeResultSha = mergeResult.MergeCommitSHA
+				GinkgoWriter.Printf("merged result sha: %s for PR #%d\n", mergeResultSha, prNumber)
+			})
+			// Now the PR is merged this will kick off another build. The result of this build is what we want to update in dockerfile we created
+			It(fmt.Sprintf("PR merge triggers PAC PipelineRun for parent component %s", ParentComponentDef.componentName), func() {
+				timeout = time.Minute * 5
+
+				Eventually(func() error {
+					pipelineRun, err := f.AsKubeAdmin.HasController.GetComponentPipelineRun(ParentComponentDef.componentName, applicationName, testNamespace, mergeResultSha)
+					if err != nil {
+						GinkgoWriter.Printf("Push PipelineRun has not been created yet for the component %s/%s\n", testNamespace, ParentComponentDef.componentName)
+						return err
+					}
+					if !pipelineRun.HasStarted() {
+						return fmt.Errorf("push pipelinerun %s/%s hasn't started yet", pipelineRun.GetNamespace(), pipelineRun.GetName())
+					}
+					return nil
+				}, timeout, constants.PipelineRunPollingInterval).Should(Succeed(), fmt.Sprintf("timed out when waiting for the PipelineRun to start for the component %s/%s", testNamespace, ParentComponentDef.componentName))
+			})
+			// Wait for this PR to be done and store the digest, we will need it to verify that the nudge was correct
+			It(fmt.Sprintf("PAC PipelineRun for parent component %s is successful", ParentComponentDef.componentName), func() {
+				pr := &pipeline.PipelineRun{}
+				Expect(f.AsKubeAdmin.HasController.WaitForComponentPipelineToBeFinished(ParentComponentDef.component, "", mergeResultSha, "", f.AsKubeAdmin.TektonController, &has.RetryOptions{Always: true, Retries: 2}, pr)).To(Succeed())
+
+				for _, result := range pr.Status.PipelineRunStatusFields.Results {
+					if result.Name == "IMAGE_DIGEST" {
+						parentPostPacMergeDigest = result.Value.StringVal
+					}
+				}
+				Expect(parentPostPacMergeDigest).ShouldNot(BeEmpty())
+			})
+			It(fmt.Sprintf("should lead to a nudge PR creation for child component %s", ChildComponentDef.componentName), func() {
+				timeout = time.Minute * 20
+				interval := time.Second * 1
+
+				Eventually(func() bool {
+					prs, err := gitClient.ListPullRequests(componentDependenciesChildRepository)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					for _, pr := range prs {
+						if strings.Contains(pr.SourceBranch, ParentComponentDef.componentName) {
+							prNumber = pr.Number
+							return true
+						}
+					}
+					return false
+				}, timeout, interval).Should(BeTrue(), fmt.Sprintf("timed out when waiting for component nudge PR to be created in %s repository", componentDependenciesChildRepoName))
+			})
+			It(fmt.Sprintf("merging the PR should be successful for child component %s", ChildComponentDef.componentName), func() {
+				Eventually(func() error {
+					mergeResult, err = gitClient.MergePullRequest(componentDependenciesChildRepository, prNumber)
+					return err
+				}, time.Minute).ShouldNot(HaveOccurred(), fmt.Sprintf("error when merging nudge pull request #%d in repo %s", prNumber, componentDependenciesChildRepoName))
+
+				mergeResultSha = mergeResult.MergeCommitSHA
+				GinkgoWriter.Printf("merged result sha: %s for PR #%d\n", mergeResultSha, prNumber)
+
+			})
+			// Now the nudge has been merged we verify the dockerfile is what we expected
+			It("Verify the nudge updated the contents", func() {
+
+				GinkgoWriter.Printf("Verifying Dockerfile.tmp updated to sha %s", parentPostPacMergeDigest)
+				file, err := gitClient.GetFile(childRepository, "Dockerfile.tmp", ChildComponentDef.componentBranch)
+				Expect(err).ShouldNot(HaveOccurred())
+				GinkgoWriter.Printf("content: %s\n", file.Content)
+				Expect(file.Content).Should(Equal("FROM quay.io/" + quayOrg + "/" + imageRepoName + "@" + parentPostPacMergeDigest + "\nRUN echo hello\n"))
+
+				file, err = gitClient.GetFile(childRepository, "manifest.yaml", ChildComponentDef.componentBranch)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(file.Content).Should(Equal("image: " + distributionRepository + "@" + parentPostPacMergeDigest))
+
+			})
+		})
+	},
+		//Entry("github", git.GitHubProvider, "gh"),
 		Entry("gitlab", git.GitLabProvider, "gl"),
 	)
 })
