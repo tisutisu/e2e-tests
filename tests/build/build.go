@@ -35,7 +35,7 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 	var err error
 	defer GinkgoRecover()
 
-	var gitClient git.Client
+	//var gitClient git.Client
 
 	DescribeTableSubtree("test PaC component build", Ordered, Label("github-webhook", "pac-build", "pipeline", "image-controller"), func(gitProvider git.GitProvider, gitPrefix string) {
 		var applicationName, customDefaultComponentName, customBranchComponentName, componentBaseBranchName string
@@ -51,6 +51,7 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 		var buildPipelineAnnotation map[string]string
 
 		var helloWorldRepository string
+		var gitClient git.Client
 
 		BeforeAll(func() {
 			if os.Getenv(constants.SKIP_PAC_TESTS_ENV) == "true" {
@@ -707,6 +708,7 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 		var buildPipelineAnnotation map[string]string
 
 		var helloWorldRepository string
+		var gitClient git.Client
 
 		BeforeAll(func() {
 			if os.Getenv(constants.SKIP_PAC_TESTS_ENV) == "true" {
