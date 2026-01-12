@@ -151,9 +151,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				timeout = time.Second * 300
 				interval = time.Second * 5
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(helloWorldRepository)
 					Expect(err).ShouldNot(HaveOccurred())
-
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 					for _, pr := range prs {
 						if pr.SourceBranch == customDefaultComponentBranch {
 							Expect(pr.TargetBranch).To(Equal(helloWorldComponentDefaultBranch))
@@ -346,8 +348,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				interval = time.Second * 5
 
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(helloWorldRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if pr.SourceBranch == pacBranchName {
@@ -491,8 +496,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				interval = time.Second * 5
 
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(helloWorldRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if pr.SourceBranch == pacBranchName {
@@ -677,8 +685,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				timeout = time.Second * 10
 				interval = time.Second * 5
 				Consistently(func() error {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(helloWorldRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if pr.SourceBranch == pacBranchName {
@@ -803,8 +814,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 					interval := time.Second * 5
 
 					Eventually(func() bool {
+						start := time.Now()
 						prs, err := f.AsKubeAdmin.CommonController.Github.ListPullRequests(multiComponentGitSourceRepoName)
 						Expect(err).ShouldNot(HaveOccurred())
+						elapsed := time.Since(start)
+						GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 						for _, pr := range prs {
 							if pr.Head.GetRef() == pacBranchName {
@@ -1491,8 +1505,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				interval := time.Second * 5
 
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(childRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if pr.SourceBranch == ChildComponentDef.pacBranchName {
@@ -1555,8 +1572,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				interval := time.Second * 5
 
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(parentRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if pr.SourceBranch == ParentComponentDef.pacBranchName {
@@ -1609,8 +1629,11 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build-ser
 				interval := time.Second * 5
 
 				Eventually(func() bool {
+					start := time.Now()
 					prs, err := gitClient.ListPullRequests(componentDependenciesChildRepository)
 					Expect(err).ShouldNot(HaveOccurred())
+					elapsed := time.Since(start)
+					GinkgoWriter.Printf(">>> for listing pull requests, took time: %s\n", elapsed)
 
 					for _, pr := range prs {
 						if strings.Contains(pr.SourceBranch, ParentComponentDef.componentName) {
