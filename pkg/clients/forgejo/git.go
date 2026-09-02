@@ -261,14 +261,20 @@ func (fc *ForgejoClient) ForkRepository(sourceProjectID, targetProjectID string)
 	var migratedRepo *forgejo.Repository
 	var lastErr error
 
+	me, _, err1 := fc.client.GetMyUserInfo()
+	if err1 != nil {
+		return nil, fmt.Errorf("failed to get authenticated user: %w", err)
+	}
+
 	err := utils.WaitUntilWithInterval(func() (done bool, err error) {
 		var resp *forgejo.Response
 		migratedRepo, resp, err = fc.client.MigrateRepo(forgejo.MigrateRepoOption{
-			RepoName:  targetRepo,
-			RepoOwner: targetOwner,
-			CloneAddr: cloneAddr,
-			Service:   forgejo.GitServicePlain,
-			AuthToken: fc.token,
+			RepoName:     targetRepo,
+			RepoOwner:    targetOwner,
+			CloneAddr:    cloneAddr,
+			Service:      forgejo.GitServicePlain,
+			AuthUsername: me.UserName,
+			AuthPassword: fc.token,
 		})
 		if err != nil {
 			lastErr = err
