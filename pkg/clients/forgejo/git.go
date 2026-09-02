@@ -267,7 +267,7 @@ func (fc *ForgejoClient) ForkRepository(sourceProjectID, targetProjectID string)
 			RepoName:  targetRepo,
 			RepoOwner: targetOwner,
 			CloneAddr: cloneAddr,
-			Service:   forgejo.GitServiceForgejo,
+			Service:   forgejo.GitServicePlain,
 			AuthToken: fc.token,
 		})
 		if err != nil {
@@ -289,10 +289,24 @@ func (fc *ForgejoClient) ForkRepository(sourceProjectID, targetProjectID string)
 				if getErr != nil {
 					return false, fmt.Errorf("error migrating project %s to %s: repo already exists but failed to fetch it: %w", sourceProjectID, targetProjectID, getErr)
 				}
+				if existingRepo.Empty {
+					// leftover shell from a failed migration — remove it and retry
+					if _, delErr := fc.client.DeleteRepo(targetOwner, targetRepo); delErr != nil {
+						return false, fmt.Errorf("failed to delete empty leftover repo %s: %w", targetProjectID, delErr)
+					}
+					return false, nil // retry the migration
+				}
 				migratedRepo = existingRepo
 				return true, nil
 			}
 			return false, nil
+		}
+		if migratedRepo.Empty {
+			lastErr = fmt.Errorf("migration returned an empty repo")
+			if _, delErr := fc.client.DeleteRepo(targetOwner, targetRepo); delErr != nil {
+				return false, fmt.Errorf("failed to delete empty leftover repo %s: %w", targetProjectID, delErr)
+			}
+			return false, nil // retry the migration
 		}
 		return true, nil
 	}, time.Second*10, time.Minute*5)
