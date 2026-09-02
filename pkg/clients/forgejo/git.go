@@ -263,7 +263,7 @@ func (fc *ForgejoClient) ForkRepository(sourceProjectID, targetProjectID string)
 
 	me, _, err1 := fc.client.GetMyUserInfo()
 	if err1 != nil {
-		return nil, fmt.Errorf("failed to get authenticated user: %w", err)
+		return nil, fmt.Errorf("failed to get authenticated user: %w", err1)
 	}
 
 	err := utils.WaitUntilWithInterval(func() (done bool, err error) {
